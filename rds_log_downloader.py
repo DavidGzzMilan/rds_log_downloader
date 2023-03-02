@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 import boto3
 from botocore.exceptions import NoRegionError, ClientError
 from time import sleep
@@ -14,23 +15,22 @@ def get_rds():
         print(str(e))
         return None
 
-def get_db_logs(rds, dbid, logdate):
+def get_db_logs(rds, dbid, logfilter):
     try:
         return rds.describe_db_log_files(
             DBInstanceIdentifier=dbid,
-            FilenameContains=logdate,
-            #FileLastWritten=int((dbinstance['InstanceCreateTime'] - timedelta(minutes=5)).timestamp()*1e3),
+            FilenameContains=logfilter,
         )['DescribeDBLogFiles']
     except Exception as e:
         print(str(e))
         return None
 
-def download_db_logs(rds, dbid, logfile, token):
+def download_db_logs(rds, dbid, logfile, token, lines):
     try:
         log = rds.download_db_log_file_portion(
             DBInstanceIdentifier=dbid,
             LogFileName=logfile,
-            NumberOfLines=1000,
+            NumberOfLines=lines,
             Marker=token
         )
         if log['ResponseMetadata']['HTTPStatusCode'] == 200:
@@ -50,18 +50,23 @@ def download_db_logs(rds, dbid, logfile, token):
         return False, 0
 
 def main():
-    rds = get_rds()
-    dbid = "prod-webapp-postgres-usw2"
-    logdate = "2023-02-26"
+    # Read args
+    args = argparse.ArgumentParser()
+    args.add_argument('-i', action='store', dest='dbid', required=True, help='RDS Instance Identifier')
+    args.add_argument('-f', action='store', dest='logfilter', required=False, default='postgresql', help='String for filtering log files to download (default: postgresql). HINT: You should use the date contained in the log file name')
+    args.add_argument('-l', action='store', dest='lines', required=False, default=2000, help='Number of lines to download per iteration (default: 2000)')
+    args.add_argument('-w', action='store', dest='wait', required=False, default=1, help='Number of seconds to wait before downloading the next log chunk (default: 1)')
 
-    for db_log in get_db_logs(rds, dbid, logdate):
+    rds = get_rds()
+
+    for db_log in get_db_logs(rds, args.dbid, args.logfilter):
         print(f"Processing logfile {db_log['LogFileName']}")
         token = '0'
-        istheremore, token = download_db_logs(rds, dbid, db_log['LogFileName'], token)
+        istheremore, token = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, args.lines)
         while istheremore:
-            print('Waiting 2secs...')
-            sleep(2)
-            istheremore, token = download_db_logs(rds, dbid, db_log['LogFileName'], token)
+            print(f'Waiting {args.wait} seconds')
+            sleep(float(args.wait))
+            istheremore, token = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, args.lines)
 
 if __name__ == '__main__':
     main()
