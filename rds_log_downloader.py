@@ -51,22 +51,29 @@ def download_db_logs(rds, dbid, logfile, token, lines):
 
 def main():
     # Read args
-    args = argparse.ArgumentParser()
-    args.add_argument('-i', action='store', dest='dbid', required=True, help='RDS Instance Identifier')
-    args.add_argument('-f', action='store', dest='logfilter', required=False, default='postgresql', help='String for filtering log files to download (default: postgresql). HINT: You should use the date contained in the log file name')
-    args.add_argument('-l', action='store', dest='lines', required=False, default=2000, help='Number of lines to download per iteration (default: 2000)')
-    args.add_argument('-w', action='store', dest='wait', required=False, default=1, help='Number of seconds to wait before downloading the next log chunk (default: 1)')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', action='store', dest='dbid', required=True, help='RDS Instance Identifier')
+    parser.add_argument('-f', action='store', dest='logfilter', required=False, default='postgresql', help='String for filtering log files to download (default: postgresql). HINT: You should use the date contained in the log file name')
+    parser.add_argument('-l', action='store', dest='lines', required=False, default=2000, help='Number of lines to download per iteration (default: 2000)')
+    parser.add_argument('-w', action='store', dest='wait', required=False, default=1, help='Number of seconds to wait before downloading the next log chunk (default: 1)')
+    args = parser.parse_args()
     rds = get_rds()
 
     for db_log in get_db_logs(rds, args.dbid, args.logfilter):
-        print(f"Processing logfile {db_log['LogFileName']}")
+        lineup = '\033[1A'
+        lineclear = '\x1b[2K'
         token = '0'
-        istheremore, token = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, args.lines)
+        count = 1
+
+        print(f"Processing logfile {db_log['LogFileName']}")
+        
+        istheremore, token = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, int(args.lines))
         while istheremore:
-            print(f'Waiting {args.wait} seconds')
+            print('Lines downloaded: {}. Waiting {} seconds'.format(int(args.lines) * count, args.wait))
             sleep(float(args.wait))
-            istheremore, token = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, args.lines)
+            istheremore, token = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, int(args.lines))
+            count = count + 1
+            print(lineup, end=lineclear)
 
 if __name__ == '__main__':
     main()
