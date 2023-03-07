@@ -13,7 +13,7 @@ The AWS credentials should be already available, accordingly with the [online do
 - Instance metadata service on an Amazon EC2 instance that has an IAM role configured
 ```
 
-## Prerequisits
+## Prerequisites
 This script was written and tested using Python 3.6. It is necessary to have this Python version available in the system.
 
 ## Executing this script
