@@ -5,12 +5,12 @@ import boto3
 from botocore.exceptions import NoRegionError, ClientError
 from time import sleep
 
-def get_rds():
+def get_rds(region):
     try:
-        return boto3.client("rds")
+        return boto3.client("rds", region)
     except NoRegionError:
-        print(f"AWS region not set, switching to us-west-2")
-        return boto3.client("rds","us-west-2")
+        print(f"AWS region not set, switching to us-east-1")
+        return boto3.client("rds","us-east-1")
     except Exception as e:
         print(str(e))
         return None
@@ -53,11 +53,12 @@ def main():
     # Read args
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', action='store', dest='dbid', required=True, help='RDS Instance Identifier')
+    parser.add_argument('-r', action='store', dest='region', required=False, default='us-east-1', help='AWS Region for the RDS instance (default: us-east-1)')
     parser.add_argument('-f', action='store', dest='logfilter', required=False, default='postgresql', help='String for filtering log files to download (default: postgresql). HINT: You should use the date contained in the log file name')
     parser.add_argument('-l', action='store', dest='lines', required=False, default=2000, help='Number of lines to download per iteration (default: 2000)')
     parser.add_argument('-w', action='store', dest='wait', required=False, default=1, help='Number of seconds to wait before downloading the next log chunk (default: 1)')
     args = parser.parse_args()
-    rds = get_rds()
+    rds = get_rds(args.region)
 
     for db_log in get_db_logs(rds, args.dbid, args.logfilter):
         lineup = '\033[1A'
