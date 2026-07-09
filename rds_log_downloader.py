@@ -30,6 +30,15 @@ def check_for_truncation(log_data):
     return "[Your log message was truncated]" in log_data
 
 
+def get_log_output_path(logfile):
+    return os.path.join(os.getcwd(), logfile.split('/')[1])
+
+
+def get_truncated_artifact_path(logfile):
+    base = logfile.split('/')[1]
+    return os.path.join(os.getcwd(), f"{base}_truncated_lines")
+
+
 class AdaptiveChunkSizer:
     """
     Remembers successful chunk sizes across downloads and picks the next request size.
@@ -91,7 +100,8 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
         min_lines: Minimum chunk size to avoid infinite loops (default: 100)
     
     Returns:
-        tuple: (has_more_data, new_token, successful_chunk_size, had_truncation_retries)
+        tuple: (has_more_data, new_token, successful_chunk_size, had_truncation_retries,
+                min_truncation_written)
     """
     initial_lines = lines
     current_lines = lines
@@ -114,9 +124,9 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
                     if current_lines <= min_lines:
                         print(f"Warning: Truncation detected but chunk size ({current_lines}) is at minimum. Writing anyway.")
                         # Write it anyway if we're at minimum
-                        with open(os.path.join(os.getcwd(), logfile.split('/')[1]), 'a+') as f:
+                        with open(get_log_output_path(logfile), 'a+') as f:
                             f.write(log_data)
-                        return log['AdditionalDataPending'], log['Marker'], current_lines, True
+                        return log['AdditionalDataPending'], log['Marker'], current_lines, True, True
                     else:
                         # Reduce chunk size and retry
                         new_lines = max(min_lines, current_lines // 2)
@@ -126,21 +136,21 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
                         continue
                 
                 # No truncation detected, write the data
-                with open(os.path.join(os.getcwd(), logfile.split('/')[1]), 'a+') as f:
+                with open(get_log_output_path(logfile), 'a+') as f:
                     f.write(log_data)
                 
-                return log['AdditionalDataPending'], log['Marker'], current_lines, current_lines < initial_lines
+                return log['AdditionalDataPending'], log['Marker'], current_lines, current_lines < initial_lines, False
             else:
                 print(f"There was an error downloading last file part. HTTP Status Code: {log['ResponseMetadata']['HTTPStatusCode']}")
                 print(f"Waiting another 30 seconds before retrying. Retries: {log['ResponseMetadata']['RetryAttempts']}")
                 sleep(30)
-                return True, token, current_lines, False
+                return True, token, current_lines, False, False
         except IOError as e:
             print(str(e))
-            return False, 0, current_lines, False
+            return False, 0, current_lines, False, False
         except Exception as e:
             print(str(e))
-            return False, 0, current_lines, False
+            return False, 0, current_lines, False, False
     
     # If we exhausted retries, write what we have
     print(f"Warning: Max retries reached. Writing chunk with {current_lines} lines.")
@@ -152,13 +162,55 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
             Marker=token
         )
         if log['ResponseMetadata']['HTTPStatusCode'] == 200:
-            with open(os.path.join(os.getcwd(), logfile.split('/')[1]), 'a+') as f:
+            with open(get_log_output_path(logfile), 'a+') as f:
                 f.write(log['LogFileData'])
-            return log['AdditionalDataPending'], log['Marker'], current_lines, current_lines < initial_lines
+            return log['AdditionalDataPending'], log['Marker'], current_lines, current_lines < initial_lines, False
     except Exception as e:
         print(f"Error in final retry: {str(e)}")
     
-    return False, 0, current_lines, False
+    return False, 0, current_lines, False, False
+
+
+def recover_truncated_chunks(rds, dbid, logfile, chunks, output_path, wait=0):
+    """
+    Re-download truncated-at-minimum chunks one line at a time into a separate artifact.
+    """
+    total_lines = 0
+    still_truncated = 0
+
+    with open(output_path, 'w') as artifact:
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            marker = chunk['start_marker']
+            print(f"Recovering chunk {chunk_index}/{len(chunks)} ({chunk['line_count']} lines)...")
+            for _ in range(chunk['line_count']):
+                try:
+                    log = rds.download_db_log_file_portion(
+                        DBInstanceIdentifier=dbid,
+                        LogFileName=logfile,
+                        NumberOfLines=1,
+                        Marker=marker,
+                    )
+                except Exception as e:
+                    print(f"Error recovering chunk {chunk_index}: {e}")
+                    break
+
+                if log['ResponseMetadata']['HTTPStatusCode'] != 200:
+                    print(f"Error recovering chunk {chunk_index}: HTTP {log['ResponseMetadata']['HTTPStatusCode']}")
+                    break
+
+                log_data = log['LogFileData']
+                artifact.write(log_data)
+                total_lines += 1
+                if check_for_truncation(log_data):
+                    still_truncated += 1
+
+                marker = log['Marker']
+                if wait:
+                    sleep(float(wait))
+
+    recovered = total_lines - still_truncated
+    return len(chunks), total_lines, recovered, still_truncated
+
 
 def main():
     # Read args
@@ -168,6 +220,7 @@ def main():
     parser.add_argument('-f', action='store', dest='logfilter', required=False, default='postgresql', help='String for filtering log files to download (default: postgresql). HINT: You should use the date contained in the log file name')
     parser.add_argument('-l', action='store', dest='lines', required=False, default=2000, help='Number of lines to download per iteration (default: 2000)')
     parser.add_argument('-w', action='store', dest='wait', required=False, default=1, help='Number of seconds to wait before downloading the next log chunk (default: 1)')
+    parser.add_argument('-F', action='store_true', dest='force_truncated', required=False, default=False, help='Re-download minimum-size truncated chunks line-by-line into <logname>_truncated_lines (default: off)')
     args = parser.parse_args()
     rds = get_rds(args.region)
 
@@ -182,11 +235,15 @@ def main():
 
         max_lines = int(args.lines)
         sizer = AdaptiveChunkSizer(max_lines, max_lines)
+        truncated_chunks = []
 
         chunk_size = sizer.next_size()
-        istheremore, token, successful_chunk_size, had_truncation = download_db_logs(
+        start_marker = token
+        istheremore, token, successful_chunk_size, had_truncation, min_truncation = download_db_logs(
             rds, args.dbid, db_log['LogFileName'], token, chunk_size
         )
+        if args.force_truncated and min_truncation:
+            truncated_chunks.append({'start_marker': start_marker, 'line_count': successful_chunk_size})
         total_lines_downloaded += successful_chunk_size
         sizer.update(successful_chunk_size, had_truncation)
 
@@ -194,13 +251,27 @@ def main():
             print('Lines downloaded: {}. Waiting {} seconds'.format(total_lines_downloaded, args.wait))
             sleep(float(args.wait))
             chunk_size = sizer.next_size()
-            istheremore, token, successful_chunk_size, had_truncation = download_db_logs(
+            start_marker = token
+            istheremore, token, successful_chunk_size, had_truncation, min_truncation = download_db_logs(
                 rds, args.dbid, db_log['LogFileName'], token, chunk_size
             )
+            if args.force_truncated and min_truncation:
+                truncated_chunks.append({'start_marker': start_marker, 'line_count': successful_chunk_size})
             total_lines_downloaded += successful_chunk_size
             sizer.update(successful_chunk_size, had_truncation)
             count = count + 1
             print(lineup, end=lineclear)
+
+        if args.force_truncated and truncated_chunks:
+            artifact_path = get_truncated_artifact_path(db_log['LogFileName'])
+            print(f"Recovering {len(truncated_chunks)} truncated chunk(s) line-by-line into {artifact_path}")
+            chunk_count, total_lines, recovered, still_truncated = recover_truncated_chunks(
+                rds, args.dbid, db_log['LogFileName'], truncated_chunks, artifact_path, args.wait
+            )
+            print(
+                f"Recovery complete: {chunk_count} chunk(s), {total_lines} line(s) written to artifact, "
+                f"{recovered} fully recovered, {still_truncated} still truncated at 1 line"
+            )
 
 if __name__ == '__main__':
     main()
