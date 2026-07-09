@@ -51,9 +51,8 @@ class AdaptiveChunkSizer:
     def next_size(self):
         return self.chunk_size
 
-    def update(self, requested_size, actual_size):
-        had_truncation = actual_size < requested_size
-        self.successful_sizes.append(actual_size)
+    def update(self, successful_chunk_size, had_truncation):
+        self.successful_sizes.append(successful_chunk_size)
 
         if had_truncation:
             self.consecutive_clean = 0
@@ -92,8 +91,9 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
         min_lines: Minimum chunk size to avoid infinite loops (default: 100)
     
     Returns:
-        tuple: (has_more_data, new_token, actual_lines_downloaded)
+        tuple: (has_more_data, new_token, successful_chunk_size, had_truncation_retries)
     """
+    initial_lines = lines
     current_lines = lines
     max_retries = 10  # Prevent infinite loops
     
@@ -116,7 +116,7 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
                         # Write it anyway if we're at minimum
                         with open(os.path.join(os.getcwd(), logfile.split('/')[1]), 'a+') as f:
                             f.write(log_data)
-                        return log['AdditionalDataPending'], log['Marker'], current_lines
+                        return log['AdditionalDataPending'], log['Marker'], current_lines, True
                     else:
                         # Reduce chunk size and retry
                         new_lines = max(min_lines, current_lines // 2)
@@ -129,18 +129,18 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
                 with open(os.path.join(os.getcwd(), logfile.split('/')[1]), 'a+') as f:
                     f.write(log_data)
                 
-                return log['AdditionalDataPending'], log['Marker'], current_lines
+                return log['AdditionalDataPending'], log['Marker'], current_lines, current_lines < initial_lines
             else:
                 print(f"There was an error downloading last file part. HTTP Status Code: {log['ResponseMetadata']['HTTPStatusCode']}")
                 print(f"Waiting another 30 seconds before retrying. Retries: {log['ResponseMetadata']['RetryAttempts']}")
                 sleep(30)
-                return True, token, current_lines
+                return True, token, current_lines, False
         except IOError as e:
             print(str(e))
-            return False, 0, current_lines
+            return False, 0, current_lines, False
         except Exception as e:
             print(str(e))
-            return False, 0, current_lines
+            return False, 0, current_lines, False
     
     # If we exhausted retries, write what we have
     print(f"Warning: Max retries reached. Writing chunk with {current_lines} lines.")
@@ -154,11 +154,11 @@ def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
         if log['ResponseMetadata']['HTTPStatusCode'] == 200:
             with open(os.path.join(os.getcwd(), logfile.split('/')[1]), 'a+') as f:
                 f.write(log['LogFileData'])
-            return log['AdditionalDataPending'], log['Marker'], current_lines
+            return log['AdditionalDataPending'], log['Marker'], current_lines, current_lines < initial_lines
     except Exception as e:
         print(f"Error in final retry: {str(e)}")
     
-    return False, 0, current_lines
+    return False, 0, current_lines, False
 
 def main():
     # Read args
@@ -184,21 +184,21 @@ def main():
         sizer = AdaptiveChunkSizer(max_lines, max_lines)
 
         chunk_size = sizer.next_size()
-        istheremore, token, actual_lines = download_db_logs(
+        istheremore, token, successful_chunk_size, had_truncation = download_db_logs(
             rds, args.dbid, db_log['LogFileName'], token, chunk_size
         )
-        total_lines_downloaded += actual_lines
-        sizer.update(chunk_size, actual_lines)
+        total_lines_downloaded += successful_chunk_size
+        sizer.update(successful_chunk_size, had_truncation)
 
         while istheremore:
             print('Lines downloaded: {}. Waiting {} seconds'.format(total_lines_downloaded, args.wait))
             sleep(float(args.wait))
             chunk_size = sizer.next_size()
-            istheremore, token, actual_lines = download_db_logs(
+            istheremore, token, successful_chunk_size, had_truncation = download_db_logs(
                 rds, args.dbid, db_log['LogFileName'], token, chunk_size
             )
-            total_lines_downloaded += actual_lines
-            sizer.update(chunk_size, actual_lines)
+            total_lines_downloaded += successful_chunk_size
+            sizer.update(successful_chunk_size, had_truncation)
             count = count + 1
             print(lineup, end=lineclear)
 
