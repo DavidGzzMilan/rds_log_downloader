@@ -29,6 +29,55 @@ def check_for_truncation(log_data):
     """Check if the log data contains the truncation message."""
     return "[Your log message was truncated]" in log_data
 
+
+class AdaptiveChunkSizer:
+    """
+    Remembers successful chunk sizes across downloads and picks the next request size.
+
+    During an initial warmup window it uses the minimum successful size seen so far.
+    After warmup it keeps a rolling minimum and occasionally probes a larger size when
+    several consecutive chunks succeed without truncation.
+    """
+
+    def __init__(self, initial_size, max_size, min_lines=100, warmup_chunks=3, probe_after_clean=3):
+        self.max_size = max_size
+        self.min_lines = min_lines
+        self.warmup_chunks = warmup_chunks
+        self.probe_after_clean = probe_after_clean
+        self.chunk_size = initial_size
+        self.successful_sizes = []
+        self.consecutive_clean = 0
+
+    def next_size(self):
+        return self.chunk_size
+
+    def update(self, requested_size, actual_size):
+        had_truncation = actual_size < requested_size
+        self.successful_sizes.append(actual_size)
+
+        if had_truncation:
+            self.consecutive_clean = 0
+        else:
+            self.consecutive_clean += 1
+
+        window = self.successful_sizes[-self.warmup_chunks:]
+        previous_size = self.chunk_size
+        self.chunk_size = max(self.min_lines, min(window))
+
+        if had_truncation:
+            print(f"Adaptive chunk size: using {self.chunk_size} lines for next chunk (reduced due to truncation)")
+        elif len(self.successful_sizes) == self.warmup_chunks:
+            print(f"Warmup complete: using {self.chunk_size} lines (min of last {self.warmup_chunks} successful chunks)")
+        elif self.consecutive_clean >= self.probe_after_clean:
+            probe_size = min(self.max_size, int(self.chunk_size * 1.5))
+            if probe_size > self.chunk_size:
+                print(f"Probing larger chunk size: {probe_size} lines after {self.consecutive_clean} clean downloads")
+                self.chunk_size = probe_size
+                self.consecutive_clean = 0
+        elif self.chunk_size != previous_size and not had_truncation:
+            print(f"Adaptive chunk size: using {self.chunk_size} lines for next chunk")
+
+
 def download_db_logs(rds, dbid, logfile, token, lines, min_lines=100):
     """
     Download a chunk of log data, verifying it's not truncated.
@@ -130,14 +179,26 @@ def main():
         total_lines_downloaded = 0
 
         print(f"Processing logfile {db_log['LogFileName']}")
-        
-        istheremore, token, actual_lines = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, int(args.lines))
+
+        max_lines = int(args.lines)
+        sizer = AdaptiveChunkSizer(max_lines, max_lines)
+
+        chunk_size = sizer.next_size()
+        istheremore, token, actual_lines = download_db_logs(
+            rds, args.dbid, db_log['LogFileName'], token, chunk_size
+        )
         total_lines_downloaded += actual_lines
+        sizer.update(chunk_size, actual_lines)
+
         while istheremore:
             print('Lines downloaded: {}. Waiting {} seconds'.format(total_lines_downloaded, args.wait))
             sleep(float(args.wait))
-            istheremore, token, actual_lines = download_db_logs(rds, args.dbid, db_log['LogFileName'], token, int(args.lines))
+            chunk_size = sizer.next_size()
+            istheremore, token, actual_lines = download_db_logs(
+                rds, args.dbid, db_log['LogFileName'], token, chunk_size
+            )
             total_lines_downloaded += actual_lines
+            sizer.update(chunk_size, actual_lines)
             count = count + 1
             print(lineup, end=lineclear)
 
